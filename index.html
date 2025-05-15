@@ -1,0 +1,348 @@
+<!DOCTYPE html>  
+<html lang="en">  
+<head>  
+  <meta charset="UTF-8">  
+  <title>Polygon Arbitrage DApp</title>  
+  <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>  
+  <style>  
+    body { background-color: #0d1b2a; color: white; font-family: Arial, sans-serif; }  
+    button, input, select { margin: 5px; padding: 5px; }  
+    table { border-collapse: collapse; width: 100%; margin-top: 10px; }  
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: center; }  
+    .profitable { background-color: #004d00; color: white; font-weight: bold; }  
+    .pending { background-color: #4d4d00; }  
+    .error { background-color: #4d0000; }  
+    .tx-link { color: #4da6ff; text-decoration: underline; cursor: pointer; }  
+  </style>  
+</head>  
+<body>  
+  <h2>Polygon Arbitrage DApp</h2>  
+  <div>  
+    <button id="connectWallet">Connect Wallet</button>  
+    <span id="walletAddress"></span> |  
+    USDC Balance: <span id="usdcBalance">0</span>  
+  </div>  
+  <div>  
+    Batch Qty (0–100): <input type="number" id="batchQty" min="0" max="100" value="1" />  
+    Min Profit %: <input type="number" id="minProfit" step="0.01" value="0.01" />  
+    <label><input type="checkbox" id="onlyProfitable" checked /> Trade Only If Profitable</label>  
+    <button id="toggleScan">Start Trading</button>  
+  </div>  
+  <table id="arbitrageTable">  
+    <thead>  
+      <tr>  
+        <th>Time</th><th>Token</th><th>Buy Router</th><th>Sell Router</th>  
+        <th>Buy Price</th><th>Sell Price</th><th>Profit %</th><th>Tx Hash</th>  
+      </tr>  
+    </thead>  
+    <tbody id="arbResults"></tbody>  
+  </table>  
+
+  <script>  
+    // Configuration  
+    const tokens = [  
+      { address: '0x7ceB23fD6bC0adD59E62ac25578270cFf1b9f619', symbol: 'WETH', decimals: 18 },  
+      { address: '0x1BFD67037B42Cf73acF2047067bd4F2C47D9BfD6', symbol: 'WBTC', decimals: 8 },  
+      { address: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', symbol: 'USDC', decimals: 6 },  
+      { address: '0x8f3Cf7ad23Cd3CaDbD9735AFf958023239c6A063', symbol: 'DAI', decimals: 18 },  
+      { address: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F', symbol: 'USDT', decimals: 6 }  
+    ];  
+    
+    const routers = [  
+      { name: 'QuickSwap', address: '0xa5E0829CaCEd8fFDD4De3c43696c57F7D7A678ff' },  
+      { name: 'SushiSwap', address: '0x1b02da8cb0d097eb8d57a175b88c7d8b47997506' },  
+      { name: 'Uniswap', address: '0xE592427A0AEce92De3Edee1F18E0157C05861564' }  
+    ];  
+    
+    const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';  
+    const USDC_DECIMALS = 6;  
+    const GAS_LIMIT = 500000;  
+    const SLIPPAGE = 0.5; // 0.5% slippage  
+    const POLYGON_SCAN_URL = 'https://polygonscan.com/tx/';  
+    
+    let provider, signer, walletAddress, scanning = false;  
+    let currentTxRowId = 0;  
+
+    // Initialize when page loads  
+    window.addEventListener('load', () => {  
+      if (window.ethereum) {  
+        window.ethereum.on('accountsChanged', handleAccountsChanged);  
+        window.ethereum.on('chainChanged', () => window.location.reload());  
+      }  
+    });  
+
+    // Handle account changes  
+    async function handleAccountsChanged(accounts) {  
+      if (accounts.length === 0) {  
+        walletAddress = null;  
+        document.getElementById('walletAddress').textContent = '';  
+        document.getElementById('usdcBalance').textContent = '0';  
+      } else {  
+        walletAddress = accounts[0];  
+        document.getElementById('walletAddress').textContent =   
+          `${walletAddress.substring(0,6)}...${walletAddress.slice(-4)}`;  
+        await updateUSDCBalance();  
+      }  
+    }  
+
+    // Connect wallet button  
+    document.getElementById('connectWallet').onclick = async () => {  
+      if (!window.ethereum) return alert('Please install MetaMask or another Web3 wallet.');  
+      try {  
+        provider = new ethers.providers.Web3Provider(window.ethereum);  
+        await provider.send("eth_requestAccounts", []);  
+        signer = provider.getSigner();  
+        walletAddress = await signer.getAddress();  
+        document.getElementById('walletAddress').textContent =   
+          `${walletAddress.substring(0,6)}...${walletAddress.slice(-4)}`;  
+        await updateUSDCBalance();  
+      } catch (error) {  
+        console.error("Wallet connection failed:", error);  
+        alert("Wallet connection failed. See console for details.");  
+      }  
+    };  
+
+    // Update USDC balance display  
+    async function updateUSDCBalance() {  
+      if (!walletAddress) return;  
+      try {  
+        const erc20 = new ethers.Contract(  
+          USDC_ADDRESS,   
+          ["function balanceOf(address) view returns (uint)"],   
+          provider  
+        );  
+        const bal = await erc20.balanceOf(walletAddress);  
+        document.getElementById('usdcBalance').textContent =   
+          ethers.utils.formatUnits(bal, USDC_DECIMALS);  
+      } catch (e) {  
+        console.error('Balance error', e);  
+      }  
+    }  
+
+    // Start/stop trading button  
+    document.getElementById('toggleScan').onclick = () => {  
+      if (!walletAddress) return alert("Please connect your wallet first.");  
+      scanning = !scanning;  
+      document.getElementById('toggleScan').textContent =   
+        scanning ? 'Stop Trading' : 'Start Trading';  
+      if (scanning) scanLoop();  
+    };  
+
+    // Main scanning loop  
+    async function scanLoop() {  
+      while (scanning) {  
+        await scanArbitrage();  
+        await new Promise(r => setTimeout(r, 10000)); // 10 second delay between scans  
+      }  
+    }  
+
+    // Scan for arbitrage opportunities  
+    async function scanArbitrage() {  
+      const batchQty = parseInt(document.getElementById('batchQty').value);  
+      const minProfit = parseFloat(document.getElementById('minProfit').value);  
+      const onlyProfitable = document.getElementById('onlyProfitable').checked;  
+      const tbody = document.getElementById('arbResults');  
+
+      for (let token of tokens) {  
+        for (let buyRouter of routers) {  
+          for (let sellRouter of routers) {  
+            if (buyRouter.address === sellRouter.address) continue;  
+            
+            currentTxRowId++;  
+            const ts = new Date().toLocaleTimeString();  
+            const tr = document.createElement('tr');  
+            tr.id = `tx-row-${currentTxRowId}`;  
+            tbody.insertBefore(tr, tbody.firstChild);  
+            
+            tr.innerHTML = `  
+              <td>${ts}</td>  
+              <td>${token.symbol}</td>  
+              <td>${buyRouter.name}</td>  
+              <td>${sellRouter.name}</td>  
+              <td>Loading...</td>  
+              <td>Loading...</td>  
+              <td>Loading...</td>  
+              <td id="tx-${currentTxRowId}">-</td>  
+            `;  
+
+            try {  
+              const [buyPrice, sellPrice] = await Promise.all([  
+                getPrice(buyRouter, token),  
+                getPrice(sellRouter, token)  
+              ]);  
+              
+              const profitPct = ((sellPrice - buyPrice) / buyPrice) * 100;  
+              
+              tr.cells[4].textContent = buyPrice.toFixed(6);  
+              tr.cells[5].textContent = sellPrice.toFixed(6);  
+              tr.cells[6].textContent = profitPct.toFixed(2) + '%';  
+              
+              if (profitPct >= minProfit) {  
+                tr.classList.add('profitable');  
+                if (!onlyProfitable || profitPct > 0) {  
+                  const txHash = await executeArbitrage(  
+                    token,   
+                    buyRouter,   
+                    sellRouter,   
+                    batchQty,  
+                    currentTxRowId  
+                  );  
+                  
+                  if (txHash) {  
+                    const txLink = document.createElement('a');  
+                    txLink.href = `${POLYGON_SCAN_URL}${txHash}`;  
+                    txLink.target = '_blank';  
+                    txLink.className = 'tx-link';  
+                    txLink.textContent = `${txHash.substring(0,6)}...${txHash.slice(-4)}`;  
+                    document.getElementById(`tx-${currentTxRowId}`).innerHTML = '';  
+                    document.getElementById(`tx-${currentTxRowId}`).appendChild(txLink);  
+                  } else {  
+                    document.getElementById(`tx-${currentTxRowId}`).textContent = 'Failed';  
+                    tr.classList.add('error');  
+                  }  
+                  
+                  await updateUSDCBalance();  
+                }  
+              }  
+            } catch (err) {  
+              console.error('Arbitrage error:', err);  
+              tr.classList.add('error');  
+              document.getElementById(`tx-${currentTxRowId}`).textContent = 'Error';  
+            }  
+          }  
+        }  
+      }  
+    }  
+
+    // Get token price from a DEX router  
+    async function getPrice(router, token) {  
+      const routerContract = new ethers.Contract(  
+        router.address,  
+        ["function getAmountsOut(uint amountIn, address[] memory path) view returns (uint[] memory)"],  
+        provider  
+      );  
+      
+      const amountIn = ethers.utils.parseUnits("1", USDC_DECIMALS);  
+      const path = [USDC_ADDRESS, token.address];  
+      
+      try {  
+        const amounts = await routerContract.getAmountsOut(amountIn, path);  
+        return parseFloat(ethers.utils.formatUnits(amounts[1], token.decimals));  
+      } catch (e) {  
+        console.error(`Price fetch error for ${token.symbol} on ${router.name}:`, e);  
+        return 0;  
+      }  
+    }  
+
+    // Execute arbitrage trade  
+    async function executeArbitrage(token, buyRouter, sellRouter, batchQty, txRowId) {  
+      try {  
+        const amountIn = ethers.utils.parseUnits(batchQty.toString(), USDC_DECIMALS);  
+        
+        // 1. Check and approve USDC spending if needed  
+        const usdcContract = new ethers.Contract(  
+          USDC_ADDRESS,  
+          [  
+            "function approve(address spender, uint256 amount) returns (bool)",  
+            "function allowance(address owner, address spender) view returns (uint256)"  
+          ],  
+          signer  
+        );  
+        
+        const allowance = await usdcContract.allowance(walletAddress, buyRouter.address);  
+        if (allowance.lt(amountIn)) {  
+          document.getElementById(`tx-${txRowId}`).textContent = 'Approving USDC...';  
+          const approveTx = await usdcContract.approve(  
+            buyRouter.address,   
+            ethers.constants.MaxUint256, // Approve max amount for efficiency  
+            { gasLimit: GAS_LIMIT }  
+          );  
+          await approveTx.wait();  
+        }  
+        
+        // 2. Buy token with USDC  
+        const buyRouterContract = new ethers.Contract(  
+          buyRouter.address,  
+          [  
+            "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) returns (uint[] memory amounts)"  
+          ],  
+          signer  
+        );  
+
+        const buyPath = [USDC_ADDRESS, token.address];  
+        const buyAmounts = await buyRouterContract.getAmountsOut(amountIn, buyPath);  
+        const amountOutMin = buyAmounts[1].mul(100 - SLIPPAGE).div(100);  
+        
+        document.getElementById(`tx-${txRowId}`).textContent = 'Buying...';  
+        const buyTx = await buyRouterContract.swapExactTokensForTokens(  
+          amountIn,  
+          amountOutMin,  
+          buyPath,  
+          walletAddress,  
+          Math.floor(Date.now() / 1000) + 300, // 5 minute deadline  
+          { gasLimit: GAS_LIMIT }  
+        );  
+        const buyReceipt = await buyTx.wait();  
+
+        // 3. Check token balance  
+        const tokenContract = new ethers.Contract(  
+          token.address,  
+          [  
+            "function balanceOf(address) view returns (uint256)",  
+            "function approve(address spender, uint256 amount) returns (bool)"  
+          ],  
+          signer  
+        );  
+        
+        const tokenBalance = await tokenContract.balanceOf(walletAddress);  
+        
+        // 4. Approve token spending if needed  
+        const tokenAllowance = await tokenContract.allowance(walletAddress, sellRouter.address);  
+        if (tokenAllowance.lt(tokenBalance)) {  
+          document.getElementById(`tx-${txRowId}`).textContent = 'Approving Token...';  
+          const tokenApproveTx = await tokenContract.approve(  
+            sellRouter.address,  
+            ethers.constants.MaxUint256,  
+            { gasLimit: GAS_LIMIT }  
+          );  
+          await tokenApproveTx.wait();  
+        }  
+        
+        // 5. Sell token back to USDC  
+        const sellRouterContract = new ethers.Contract(  
+          sellRouter.address,  
+          [  
+            "function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) returns (uint[] memory amounts)"  
+          ],  
+          signer  
+        );  
+
+        const sellPath = [token.address, USDC_ADDRESS];  
+        const sellAmounts = await sellRouterContract.getAmountsOut(tokenBalance, sellPath);  
+        const sellAmountOutMin = sellAmounts[1].mul(100 - SLIPPAGE).div(100);  
+        
+        document.getElementById(`tx-${txRowId}`).textContent = 'Selling...';  
+        const sellTx = await sellRouterContract.swapExactTokensForTokens(  
+          tokenBalance,  
+          sellAmountOutMin,  
+          sellPath,  
+          walletAddress,  
+          Math.floor(Date.now() / 1000) + 300, // 5 minute deadline  
+          { gasLimit: GAS_LIMIT }  
+        );  
+        const sellReceipt = await sellTx.wait();  
+
+        return sellReceipt.transactionHash;  
+      } catch (error) {  
+        console.error('Arbitrage execution failed:', error);  
+        return null;  
+      }  
+    }  
+  </script>  
+</body>  
+</html>
+
+
+
+
+

@@ -241,7 +241,7 @@
         
         // 1. Check and approve USDC spending if needed  
         const usdcContract = new ethers.Contract(  
-          USDC_ADDRESS,  
+          USDC_ADDRESS, await new Promise(r => setTimeout(r, 4000)); 
           [  
             "function approve(address spender, uint256 amount) returns (bool)",  
             "function allowance(address owner, address spender) view returns (uint256)"  
